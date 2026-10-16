@@ -1,0 +1,241 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PDF Folder Viewer</title>
+<style>
+  :root { --bg:#f4f4f6; --panel:#fff; --text:#1d1d1f; --muted:#6b6b73; --accent:#2563eb; --border:#dcdce1; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#16161a; --panel:#1f1f25; --text:#ececf1; --muted:#9a9aa5; --accent:#5b8cff; --border:#33333c; }
+  }
+  * { box-sizing: border-box; }
+  html, body { height:100%; margin:0; }
+  body { font-family: system-ui, -apple-system, Segoe UI, sans-serif; background:var(--bg); color:var(--text);
+         display:flex; flex-direction:column; }
+  header { display:flex; gap:8px; align-items:center; padding:8px 12px; background:var(--panel);
+           border-bottom:1px solid var(--border); flex-wrap:wrap; }
+  header h1 { font-size:15px; margin:0 8px 0 0; }
+  button, input { font:inherit; }
+  button { background:var(--accent); color:#fff; border:0; border-radius:6px; padding:6px 12px; cursor:pointer; }
+  button.secondary { background:transparent; color:var(--text); border:1px solid var(--border); }
+  input[type=search] { padding:6px 10px; border:1px solid var(--border); border-radius:6px;
+                       background:var(--bg); color:var(--text); min-width:160px; }
+  #folderName { color:var(--muted); font-size:13px; }
+  main { flex:1; display:flex; min-height:0; }
+  body.left main { flex-direction:row; }
+  body.top main { flex-direction:column; }
+  #list { background:var(--panel); overflow:auto; padding:8px; display:flex; gap:8px; }
+  body.left #list { width:170px; flex-direction:column; border-right:1px solid var(--border); }
+  body.top #list { height:150px; flex-direction:row; border-bottom:1px solid var(--border); flex-shrink:0; }
+  .item { flex:0 0 auto; width:130px; border:2px solid transparent; border-radius:8px; padding:6px;
+          cursor:pointer; text-align:center; background:var(--bg); }
+  body.left .item { width:100%; }
+  .item:hover { border-color:var(--border); }
+  .item.active { border-color:var(--accent); }
+  .thumb { height:90px; display:flex; align-items:center; justify-content:center; background:#fff;
+           border-radius:4px; overflow:hidden; font-size:30px; }
+  .thumb canvas { max-width:100%; max-height:100%; }
+  .name { font-size:11px; margin-top:4px; overflow:hidden; display:-webkit-box;
+          -webkit-line-clamp:2; -webkit-box-orient:vertical; word-break:break-word; }
+  #viewer { flex:1; min-width:0; min-height:0; position:relative; }
+  #viewer iframe { width:100%; height:100%; border:0; background:#fff; }
+  #msg { position:absolute; inset:0; display:flex; flex-direction:column; gap:12px; align-items:center;
+         justify-content:center; text-align:center; color:var(--muted); padding:20px; }
+  #msg[hidden] { display:none; }
+</style>
+</head>
+<body class="left">
+<header>
+  <h1>📄 PDF Viewer</h1>
+  <button id="openBtn">Open folder</button>
+  <button id="reopenBtn" class="secondary" hidden>Reopen last folder</button>
+  <input id="search" type="search" placeholder="Filter files…">
+  <button id="layoutBtn" class="secondary" title="Switch list position">Layout: left</button>
+  <button id="refreshBtn" class="secondary" title="Rescan folder">↻</button>
+  <span id="folderName"></span>
+</header>
+<main>
+  <div id="list"></div>
+  <div id="viewer">
+    <iframe id="frame" hidden></iframe>
+    <div id="msg">Click “Open folder” to choose a folder with PDF files.</div>
+  </div>
+</main>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+<script>
+const $ = id => document.getElementById(id);
+const listEl = $('list'), frame = $('frame'), msg = $('msg');
+let dirHandle = null, files = [], currentUrl = null, activeKey = null;
+
+/* ---------- IndexedDB: remember folder handle ---------- */
+const dbp = new Promise((res, rej) => {
+  const r = indexedDB.open('pdf-viewer', 1);
+  r.onupgradeneeded = () => r.result.createObjectStore('kv');
+  r.onsuccess = () => res(r.result);
+  r.onerror = () => rej(r.error);
+});
+async function kv(mode, fn) {
+  const db = await dbp;
+  return new Promise((res, rej) => {
+    const req = fn(db.transaction('kv', mode).objectStore('kv'));
+    req.onsuccess = () => res(req.result); req.onerror = () => rej(req.error);
+  });
+}
+const saveHandle = h => kv('readwrite', s => s.put(h, 'dir'));
+const loadHandle = () => kv('readonly', s => s.get('dir'));
+
+/* ---------- Layout ---------- */
+function setLayout(l) {
+  document.body.className = l;
+  $('layoutBtn').textContent = 'Layout: ' + l;
+  localStorage.setItem('layout', l);
+}
+setLayout(localStorage.getItem('layout') || 'left');
+$('layoutBtn').onclick = () => setLayout(document.body.classList.contains('left') ? 'top' : 'left');
+
+/* ---------- Scan folder ---------- */
+async function scan(dir, prefix = '') {
+  const out = [];
+  for await (const [name, h] of dir.entries()) {
+    if (h.kind === 'file' && name.toLowerCase().endsWith('.pdf')) out.push({ key: prefix + name, name, handle: h });
+    else if (h.kind === 'directory' && !name.startsWith('.')) out.push(...await scan(h, prefix + name + '/'));
+  }
+  return out;
+}
+
+async function loadFolder(handle) {
+  dirHandle = handle;
+  $('folderName').textContent = '📁 ' + handle.name;
+  msg.hidden = false; msg.textContent = 'Scanning…';
+  files = (await scan(handle)).sort((a, b) => a.key.localeCompare(b.key, undefined, { numeric: true }));
+  renderList();
+  if (!files.length) { msg.textContent = 'No PDF files found in this folder.'; return; }
+  msg.textContent = 'Select a PDF from the list.';
+  const last = localStorage.getItem('lastFile');
+  const f = files.find(x => x.key === last);
+  if (f) openFile(f);
+}
+
+/* ---------- Thumbnails (lazy) ---------- */
+let workerReady = null;
+function initPdfJs() {
+  if (!workerReady) workerReady = (async () => {
+    try {
+      const src = await (await fetch('https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js')).text();
+      pdfjsLib.GlobalWorkerOptions.workerSrc = URL.createObjectURL(new Blob([src], { type: 'text/javascript' }));
+      return true;
+    } catch (e) { return false; }
+  })();
+  return workerReady;
+}
+const queue = []; let running = 0;
+function enqueue(task) { queue.push(task); pump(); }
+function pump() {
+  while (running < 2 && queue.length) {
+    running++;
+    queue.shift()().finally(() => { running--; pump(); });
+  }
+}
+async function makeThumb(f, box) {
+  if (!(await initPdfJs())) return;
+  const file = await f.handle.getFile();
+  if (file.size > 80 * 1024 * 1024) return;
+  const url = URL.createObjectURL(file);
+  try {
+    const pdf = await pdfjsLib.getDocument(url).promise;
+    const page = await pdf.getPage(1);
+    const vp0 = page.getViewport({ scale: 1 });
+    const vp = page.getViewport({ scale: 160 / vp0.width });
+    const c = document.createElement('canvas');
+    c.width = vp.width; c.height = vp.height;
+    await page.render({ canvasContext: c.getContext('2d'), viewport: vp }).promise;
+    box.textContent = ''; box.appendChild(c);
+    pdf.destroy();
+  } catch (e) { /* keep icon */ }
+  finally { URL.revokeObjectURL(url); }
+}
+const io = new IntersectionObserver(entries => {
+  for (const e of entries) if (e.isIntersecting) {
+    io.unobserve(e.target);
+    const f = files.find(x => x.key === e.target.dataset.key);
+    if (f) enqueue(() => makeThumb(f, e.target.querySelector('.thumb')));
+  }
+}, { root: listEl, rootMargin: '200px' });
+
+/* ---------- List ---------- */
+function renderList() {
+  const q = $('search').value.trim().toLowerCase();
+  listEl.innerHTML = '';
+  io.disconnect();
+  for (const f of files) {
+    if (q && !f.key.toLowerCase().includes(q)) continue;
+    const d = document.createElement('div');
+    d.className = 'item' + (f.key === activeKey ? ' active' : '');
+    d.dataset.key = f.key; d.title = f.key;
+    d.innerHTML = '<div class="thumb">📄</div><div class="name"></div>';
+    d.querySelector('.name').textContent = f.name.replace(/\.pdf$/i, '');
+    d.onclick = () => openFile(f);
+    listEl.appendChild(d);
+    io.observe(d);
+  }
+}
+$('search').oninput = renderList;
+
+async function openFile(f) {
+  activeKey = f.key;
+  localStorage.setItem('lastFile', f.key);
+  document.querySelectorAll('.item').forEach(i => i.classList.toggle('active', i.dataset.key === f.key));
+  try {
+    const file = await f.handle.getFile();
+    if (currentUrl) URL.revokeObjectURL(currentUrl);
+    currentUrl = URL.createObjectURL(file);
+    frame.src = currentUrl;
+    frame.hidden = false; msg.hidden = true;
+    document.title = f.name + ' – PDF Viewer';
+  } catch (e) {
+    frame.hidden = true; msg.hidden = false;
+    msg.textContent = 'Could not open file: ' + e.message;
+  }
+}
+
+/* ---------- Buttons ---------- */
+$('openBtn').onclick = async () => {
+  if (!window.showDirectoryPicker) {
+    alert('Your browser does not support folder access. Please use Chrome, Edge or Opera on desktop.');
+    return;
+  }
+  try {
+    const h = await showDirectoryPicker({ id: 'pdf-viewer', mode: 'read' });
+    await saveHandle(h);
+    $('reopenBtn').hidden = true;
+    await loadFolder(h);
+  } catch (e) { /* cancelled */ }
+};
+$('refreshBtn').onclick = () => dirHandle && loadFolder(dirHandle);
+$('reopenBtn').onclick = async () => {
+  const h = await loadHandle();
+  if (h && (await h.requestPermission({ mode: 'read' })) === 'granted') {
+    $('reopenBtn').hidden = true;
+    loadFolder(h);
+  }
+};
+
+/* ---------- Auto-restore on page load ---------- */
+(async () => {
+  if (!window.showDirectoryPicker) {
+    msg.textContent = 'This browser cannot open local folders. Please use Chrome, Edge or Opera on desktop.';
+    return;
+  }
+  try {
+    const h = await loadHandle();
+    if (!h) return;
+    $('folderName').textContent = '📁 ' + h.name;
+    if ((await h.queryPermission({ mode: 'read' })) === 'granted') loadFolder(h);
+    else { $('reopenBtn').hidden = false; msg.textContent = 'Click “Reopen last folder” to continue where you left off.'; }
+  } catch (e) { console.warn(e); }
+})();
+</script>
+</body>
+</html>
